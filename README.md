@@ -237,6 +237,8 @@ The checksum (FNV-1a) catches truncation and accidental corruption. It does not 
 
 Each write stores every item, so keep the queue small. Discard `failed` and `dead` items you no longer need, and keep large data out of the payload.
 
+To wipe the queue, call `queue.clear()`. Removing `<storageKey>` from storage by hand does nothing, because the data lives in `<storageKey>:a` and `<storageKey>:b`. If an old item survives that way, enqueuing its key again returns the old item instead of sending, which is the deduplication working as intended.
+
 ## Sensitive data
 
 The payload is stored as JSON in whatever `storage` you pass. AsyncStorage keeps it unencrypted in the app's sandbox. For sensitive data:
