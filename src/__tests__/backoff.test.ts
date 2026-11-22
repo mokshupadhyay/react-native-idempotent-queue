@@ -20,8 +20,8 @@ describe('backoff', () => {
   it('stays within bounds for any policy, failure count and random value', () => {
     fc.assert(
       fc.property(
-        fc.integer({ min: 0, max: 100000 }),
-        fc.integer({ min: 0, max: 1000000 }),
+        fc.integer({ min: 10, max: 100000 }),
+        fc.integer({ min: 10, max: 1000000 }),
         fc.integer({ min: 1, max: 2000 }),
         fc.double({ min: -1, max: 2, noNaN: false }),
         (baseDelayMs, maxDelayMs, failures, r) => {
@@ -46,6 +46,8 @@ describe('backoff', () => {
     expect(() => resolveRetryPolicy({ maxAttempts: 0 })).toThrow(TypeError);
     expect(() => resolveRetryPolicy({ maxAttempts: 2.5 })).toThrow(TypeError);
     expect(() => resolveRetryPolicy({ baseDelayMs: -1 })).toThrow(TypeError);
+    expect(() => resolveRetryPolicy({ baseDelayMs: 0 })).toThrow(TypeError);
+    expect(() => resolveRetryPolicy({ maxDelayMs: 9 })).toThrow(TypeError);
     expect(() => resolveRetryPolicy({ maxDelayMs: Infinity })).toThrow(TypeError);
     expect(() => resolveRetryPolicy({ baseDelayMs: NaN })).toThrow(TypeError);
   });

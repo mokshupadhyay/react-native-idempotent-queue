@@ -44,8 +44,8 @@ const mutations = [
     property: 'property 1',
     description: 'Drop the dedupe by key in enqueue',
     file: 'src/queue.ts',
-    find: '        if (existing) return existing;',
-    replace: '        if (existing && false) return existing;',
+    find: '      if (existing) return existing;',
+    replace: '      if (existing && false) return existing;',
   },
   {
     property: 'property 4',
@@ -53,6 +53,30 @@ const mutations = [
     file: 'src/queue.ts',
     find: 'const write = save();',
     replace: 'const write = Promise.resolve();',
+  },
+  {
+    property: 'property 5',
+    test: 'property 5.*holds for any classifier output',
+    description: "Accept a classifier's delayMs without clamping it",
+    file: 'src/queue.ts',
+    find: '  const delay = clampRetryDelay(delayMs);',
+    replace: "  const delay = typeof delayMs === 'number' && !Number.isNaN(delayMs) ? delayMs : undefined;",
+  },
+  {
+    property: 'property 5',
+    test: 'property 5.*holds for any classifier output',
+    description: 'Drop the lower bound of a classifier delay, so -Infinity gets through',
+    file: 'src/backoff.ts',
+    find: 'return Math.min(MAX_RETRY_DELAY_MS, Math.max(MIN_RETRY_DELAY_MS, Math.round(value)));',
+    replace: 'return Math.min(MAX_RETRY_DELAY_MS, Math.round(value));',
+  },
+  {
+    property: 'property 5',
+    test: 'property 5.*storage layer never writes',
+    description: 'Store a write without decoding it first',
+    file: 'src/persistence.ts',
+    find: '      if (!check.ok) throw new Error(',
+    replace: '      if (false && !check.ok) throw new Error(',
   },
 ];
 
@@ -70,7 +94,7 @@ for (const [index, mutation] of mutations.entries()) {
     writeFileSync(mutation.file, source.replace(mutation.find, mutation.replace));
     run = spawnSync(
       process.execPath,
-      [jest, 'src/__tests__/properties.test.ts', '-t', mutation.property, '--ci'],
+      [jest, 'src/__tests__/properties.test.ts', '-t', mutation.test || mutation.property, '--ci'],
       { encoding: 'utf8', env: { ...process.env, NUM_RUNS: process.env.NUM_RUNS || '120' } },
     );
   } finally {

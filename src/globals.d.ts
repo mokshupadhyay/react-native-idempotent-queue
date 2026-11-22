@@ -7,3 +7,9 @@ declare function clearTimeout(handle: unknown): void;
 
 // Metro provides CommonJS `require` in every module.
 declare function require(id: string): any;
+
+// React Native 0.60+ and every current browser and Node provide it; it is
+// checked with `typeof` before use.
+declare const AbortController: {
+  new (): { readonly signal: import('./types').AbortSignalLike; abort(): void };
+};

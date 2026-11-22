@@ -14,11 +14,35 @@ import type { QueueErrorKind, QueueItem, QueueItemStatus, QueueStorage } from '.
  * On load the valid envelope with the highest `seq` wins. A slot that fails to
  * parse, has an unknown version, a wrong checksum or an invalid item is copied
  * to `<prefix>:quarantine` and ignored; loading never throws for bad data.
+ *
+ * Every write is decoded with the same checks before it is stored, so the
+ * queue never writes a slot that its next load would quarantine.
  */
 export const DEFAULT_STORAGE_KEY = 'react-native-idempotent-queue';
 export const FORMAT = 'react-native-idempotent-queue';
 export const VERSION = 1;
-const MAX_QUARANTINE_ENTRIES = 5;
+export const MAX_QUARANTINE_ENTRIES = 5;
+/**
+ * Default `maxStorageBytes`: 1 MB. Android's AsyncStorage cannot read a value
+ * larger than about 2 MB (the SQLite cursor window), so this leaves room.
+ */
+export const DEFAULT_MAX_STORAGE_BYTES = 1000 * 1000;
+
+/** UTF-8 length of a string, which is roughly what a value takes in SQLite. */
+export function utf8Length(text: string): number {
+  let bytes = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      // A surrogate pair is one 4-byte character.
+      bytes += 4;
+      i++;
+    } else bytes += 3;
+  }
+  return bytes;
+}
 
 export type Slot = 'a' | 'b';
 
@@ -31,7 +55,12 @@ export interface QuarantineEntry {
   at: number;
   storageKey: string;
   reason: string;
+  /** The unreadable value, cut short when `truncated` is set. */
   raw: string;
+  /** Checksum of the whole unreadable value, used to skip copying it twice. */
+  rawChecksum?: string;
+  /** Set when `raw` was cut to keep the quarantine within `maxStorageBytes`. */
+  truncated?: boolean;
 }
 
 /** FNV-1a over UTF-16 code units, as 8 hex digits. Detects truncation and bit flips, not tampering. */
@@ -127,6 +156,13 @@ export interface PersistenceHooks {
   now(): number;
 }
 
+export interface PersistenceOptions {
+  /** Largest quarantine value, in UTF-8 bytes. Default `DEFAULT_MAX_STORAGE_BYTES`. */
+  maxBytes?: number;
+}
+
+const other = (slot: Slot): Slot => (slot === 'a' ? 'b' : 'a');
+
 /**
  * Reads and writes the queue's state. Writes run one at a time; a write
  * requested while another is waiting shares that waiting write, which reads
@@ -137,12 +173,18 @@ export class QueuePersistence {
   private queued: Promise<void> | undefined;
   private seq = 0;
   private nextSlot: Slot = 'a';
+  /** Whether `seq` is known to be the highest valid one in storage. */
+  private known = false;
+  private readonly maxBytes: number;
 
   constructor(
     private readonly storage: QueueStorage,
     private readonly prefix: string,
     private readonly hooks: PersistenceHooks,
-  ) {}
+    options: PersistenceOptions = {},
+  ) {
+    this.maxBytes = options.maxBytes || DEFAULT_MAX_STORAGE_BYTES;
+  }
 
   slotKey(slot: Slot): string {
     return `${this.prefix}:${slot}`;
@@ -169,27 +211,42 @@ export class QueuePersistence {
       if (!best || result.state.seq > best.state.seq) best = { slot, state: result.state };
     });
     for (const entry of bad) await this.quarantine(this.slotKey(entry.slot), entry.reason, entry.raw);
+    this.known = true;
     if (best) {
-      this.seq = best.state.seq;
-      this.nextSlot = best.slot === 'a' ? 'b' : 'a';
+      this.seq = Math.max(this.seq, best.state.seq);
+      this.nextSlot = other(best.slot);
       return best.state;
     }
     // Overwrite a corrupted slot first, keeping any other copy.
-    this.seq = 0;
     this.nextSlot = bad.length === 1 ? bad[0].slot : 'a';
-    return { items: [], seq: 0 };
+    return { items: [], seq: this.seq };
   }
 
-  /** Writes `read()` as it is when the write starts. */
+  /**
+   * The stored size, in UTF-8 bytes, of a slot holding `items`. Throws if the
+   * items cannot be encoded.
+   */
+  measure(items: readonly QueueItem[]): number {
+    return utf8Length(encodeEnvelope(items, this.seq + 1));
+  }
+
+  /**
+   * Writes `read()` as it is when the write starts. Rejects, without writing,
+   * if the state would not pass load validation.
+   */
   save(read: () => readonly QueueItem[]): Promise<void> {
     if (this.queued) return this.queued;
     const run = async () => {
       this.queued = undefined;
       const seq = this.seq + 1;
       const slot = this.nextSlot;
-      await this.storage.setItem(this.slotKey(slot), encodeEnvelope(read(), seq));
+      const value = encodeEnvelope(read(), seq);
+      // Never store a slot that the next load would quarantine.
+      const check = decodeEnvelope(value);
+      if (!check.ok) throw new Error(`Refusing to write a queue state that would not load: ${check.reason}`);
+      await this.storage.setItem(this.slotKey(slot), value);
       this.seq = seq;
-      this.nextSlot = slot === 'a' ? 'b' : 'a';
+      this.nextSlot = other(slot);
     };
     const promise = this.chain.then(run, run);
     this.queued = promise;
@@ -200,13 +257,56 @@ export class QueuePersistence {
     return promise;
   }
 
-  /** Removes both slots and the quarantine, after the writes already requested. */
-  clear(): Promise<void> {
+  /** Resolves when every write requested so far, and any requested meanwhile, has finished. */
+  async idle(): Promise<void> {
+    let chain: Promise<void>;
+    do {
+      chain = this.chain;
+      await chain;
+    } while (chain !== this.chain);
+  }
+
+  /**
+   * Deletes the stored state, after the writes already requested, in an order
+   * that is safe if the app dies or a step fails:
+   *
+   * 1. write an empty state with a higher `seq`, through the usual alternating
+   *    write (a torn write leaves the previous copy, as for any write);
+   * 2. remove the other slot, which now holds an older state;
+   * 3. remove the quarantine;
+   * 4. remove the slot written in step 1.
+   *
+   * After step 1 every load finds an empty queue, so `onEmptied` is called
+   * then. A failure in a later step rejects but leaves only data that never
+   * loads again: an older `seq` beside the empty state, or the empty state.
+   * When storage could not be read, the seq is unknown, so the slots are
+   * removed directly and `onEmptied` runs only once all of them are gone.
+   */
+  clear(onEmptied: () => void = () => undefined): Promise<void> {
     const run = async () => {
-      await this.storage.removeItem(this.slotKey('a'));
-      await this.storage.removeItem(this.slotKey('b'));
+      this.queued = undefined;
+      if (!this.known) {
+        try {
+          await this.load();
+        } catch {
+          await this.storage.removeItem(this.slotKey('a'));
+          await this.storage.removeItem(this.slotKey('b'));
+          await this.storage.removeItem(this.quarantineKey);
+          this.nextSlot = 'a';
+          onEmptied();
+          return;
+        }
+      }
+      const slot = this.nextSlot;
+      const seq = this.seq + 1;
+      await this.storage.setItem(this.slotKey(slot), encodeEnvelope([], seq));
+      this.seq = seq;
+      this.nextSlot = other(slot);
+      onEmptied();
+      await this.storage.removeItem(this.slotKey(other(slot)));
       await this.storage.removeItem(this.quarantineKey);
-      this.seq = 0;
+      await this.storage.removeItem(this.slotKey(slot));
+      // `seq` keeps growing, so a copy that survived anywhere stays older.
       this.nextSlot = 'a';
     };
     const promise = this.chain.then(run, run);
@@ -218,7 +318,11 @@ export class QueuePersistence {
     return promise;
   }
 
-  /** Copies unreadable data aside so it can be inspected; never throws. */
+  /**
+   * Copies unreadable data aside so it can be inspected; never throws. Keeps
+   * at most `MAX_QUARANTINE_ENTRIES` entries and `maxBytes` in total: older
+   * entries are dropped first, then the newest is cut short.
+   */
   private async quarantine(storageKey: string, reason: string, raw: string): Promise<void> {
     this.hooks.onQuarantine(reason, storageKey);
     try {
@@ -227,14 +331,32 @@ export class QueuePersistence {
       if (existing) {
         try {
           const parsed = JSON.parse(existing) as unknown;
-          if (Array.isArray(parsed)) entries = parsed as QuarantineEntry[];
+          if (Array.isArray(parsed)) entries = parsed.filter((entry) => isObject(entry)) as unknown as QuarantineEntry[];
         } catch {
           entries = [];
         }
       }
-      if (entries.some((entry) => entry && entry.raw === raw && entry.storageKey === storageKey)) return;
-      entries.push({ at: this.hooks.now(), storageKey, reason, raw });
-      await this.storage.setItem(this.quarantineKey, JSON.stringify(entries.slice(-MAX_QUARANTINE_ENTRIES)));
+      const rawChecksum = checksum(raw);
+      const seen = entries.some(
+        (entry) =>
+          entry.storageKey === storageKey && (entry.raw === raw || (entry.truncated && entry.rawChecksum === rawChecksum)),
+      );
+      if (seen) return;
+      entries.push({ at: this.hooks.now(), storageKey, reason, raw, rawChecksum });
+      entries = entries.slice(-MAX_QUARANTINE_ENTRIES);
+      const size = () => utf8Length(JSON.stringify(entries));
+      while (entries.length > 1 && size() > this.maxBytes) entries.shift();
+      const last = entries[entries.length - 1];
+      let excess = size() - this.maxBytes;
+      while (excess > 0 && last.raw.length > 0) {
+        // Cut by the excess (at least a sixth of what is left), as JSON escaping makes sizes uneven.
+        const cut = Math.max(excess, Math.ceil(last.raw.length / 6));
+        last.raw = last.raw.slice(0, Math.max(0, last.raw.length - cut));
+        last.truncated = true;
+        excess = size() - this.maxBytes;
+      }
+      if (excess > 0) return;
+      await this.storage.setItem(this.quarantineKey, JSON.stringify(entries));
     } catch (error) {
       this.hooks.onStorageError(error);
     }

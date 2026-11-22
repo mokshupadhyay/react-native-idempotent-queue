@@ -1,6 +1,6 @@
 {
   "name": "react-native-idempotent-queue",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A persistent request queue for React Native that saves each state-changing request before sending it, retries it with the same idempotency key after failures and app restarts, and never sends it in parallel with itself. JavaScript only, so it works on the old and new architecture.",
   "main": "lib/commonjs/index.js",
   "module": "lib/module/index.js",

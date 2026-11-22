@@ -12,6 +12,33 @@ export const DEFAULT_RETRY_POLICY: ResolvedRetryPolicy = {
   maxDelayMs: 60000,
 };
 
+/**
+ * The longest wait the queue schedules after a failure, from a classifier's
+ * `delayMs` or a `Retry-After` header: 24 hours. Longer values, `Infinity`
+ * included, are cut to this.
+ */
+export const MAX_RETRY_DELAY_MS = 24 * 60 * 60 * 1000;
+
+/** The smallest accepted `baseDelayMs` and `maxDelayMs`. */
+export const MIN_POLICY_DELAY_MS = 10;
+
+/**
+ * The shortest wait before an automatic retry. A zero delay would start the
+ * next attempt in the same turn of the event loop; with a `send` that fails
+ * at once, that loop never lets anything else run.
+ */
+export const MIN_RETRY_DELAY_MS = 1;
+
+/**
+ * A delay from outside (a classifier, a header) as a safe number of
+ * milliseconds in `[MIN_RETRY_DELAY_MS, MAX_RETRY_DELAY_MS]`, or `undefined`
+ * when it is not a number at all.
+ */
+export function clampRetryDelay(value: unknown): number | undefined {
+  if (typeof value !== 'number' || Number.isNaN(value)) return undefined;
+  return Math.min(MAX_RETRY_DELAY_MS, Math.max(MIN_RETRY_DELAY_MS, Math.round(value)));
+}
+
 function check(name: string, value: number, min: number): number {
   if (typeof value !== 'number' || Number.isNaN(value) || value < min) {
     throw new TypeError(`retry.${name} must be a number >= ${min}, got ${String(value)}`);
@@ -25,8 +52,8 @@ export function resolveRetryPolicy(policy: RetryPolicy | undefined): ResolvedRet
   if (maxAttempts !== Infinity && Math.floor(maxAttempts) !== maxAttempts) {
     throw new TypeError(`retry.maxAttempts must be an integer or Infinity, got ${maxAttempts}`);
   }
-  const baseDelayMs = check('baseDelayMs', merged.baseDelayMs, 0);
-  const maxDelayMs = check('maxDelayMs', merged.maxDelayMs, 0);
+  const baseDelayMs = check('baseDelayMs', merged.baseDelayMs, MIN_POLICY_DELAY_MS);
+  const maxDelayMs = check('maxDelayMs', merged.maxDelayMs, MIN_POLICY_DELAY_MS);
   if (!isFinite(baseDelayMs) || !isFinite(maxDelayMs)) {
     throw new TypeError('retry.baseDelayMs and retry.maxDelayMs must be finite');
   }

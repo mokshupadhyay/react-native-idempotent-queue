@@ -1,3 +1,4 @@
+import { MAX_RETRY_DELAY_MS } from './backoff';
 import type { ClassifyContext, ErrorClassification } from './types';
 
 type HeaderSource =
@@ -47,18 +48,27 @@ function readHeader(headers: unknown, name: string): string | undefined {
 
 /**
  * Parses a `Retry-After` value: delay-seconds or an HTTP date.
- * Returns milliseconds from `now`, never negative, or `undefined` if invalid.
+ * Returns milliseconds from `now` in `[0, MAX_RETRY_DELAY_MS]` (24 hours), or
+ * `undefined` if invalid. Longer waits, such as a 400-digit number of seconds,
+ * are cut to 24 hours.
  */
 export function parseRetryAfter(value: string | null | undefined, now: number): number | undefined {
   if (value == null) return undefined;
   const trimmed = String(value).trim();
   if (trimmed === '') return undefined;
-  if (/^\d+(\.\d+)?$/.test(trimmed)) return Math.round(parseFloat(trimmed) * 1000);
-  // An HTTP date names a weekday or month; this also stops Date.parse('-1') from reading a year.
-  if (!/[a-z]/i.test(trimmed)) return undefined;
-  const date = Date.parse(trimmed);
-  if (Number.isNaN(date)) return undefined;
-  return Math.max(0, date - now);
+  let delayMs: number;
+  if (/^\d+(\.\d+)?$/.test(trimmed)) {
+    delayMs = Math.round(parseFloat(trimmed) * 1000);
+  } else {
+    // An HTTP date names a weekday or month; this also stops Date.parse('-1') from reading a year.
+    if (!/[a-z]/i.test(trimmed)) return undefined;
+    const date = Date.parse(trimmed);
+    if (Number.isNaN(date)) return undefined;
+    delayMs = date - now;
+  }
+  // A huge digit string parses to Infinity; a bad `now` gives NaN.
+  if (Number.isNaN(delayMs)) return undefined;
+  return Math.min(MAX_RETRY_DELAY_MS, Math.max(0, delayMs));
 }
 
 /** The HTTP status and headers of an error, if it has them. */
@@ -79,14 +89,20 @@ export function httpDetails(error: unknown): { status: number; headers: unknown 
  * | Error | Decision |
  * | --- | --- |
  * | No HTTP status (network failure, timeout, any other thrown value) | retryable |
- * | 408, 425, 429, 500-599 | retryable; `rateLimited` when a valid `Retry-After` is present |
+ * | 408, 409, 425, 429, 500-599 | retryable; `rateLimited` when a valid `Retry-After` is present |
  * | Any other status (other 4xx, and 1xx-3xx thrown as errors) | permanent |
+ *
+ * 409 is retryable because servers that implement idempotency keys (Stripe,
+ * and the IETF `Idempotency-Key` header draft) answer 409 while a request with
+ * the same key is still being processed. Treating it as permanent would mark
+ * the item `dead` although the server goes on to apply it.
  */
 export function defaultClassifyError(error: unknown, context: Pick<ClassifyContext, 'now'>): ErrorClassification {
   const details = httpDetails(error);
   if (!details) return { type: 'retryable' };
   const { status } = details;
-  const retryable = status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
+  const retryable =
+    status === 408 || status === 409 || status === 425 || status === 429 || (status >= 500 && status <= 599);
   if (!retryable) return { type: 'permanent' };
   const delayMs = parseRetryAfter(readHeader(details.headers, 'Retry-After'), context.now);
   if (delayMs !== undefined) return { type: 'rateLimited', delayMs };

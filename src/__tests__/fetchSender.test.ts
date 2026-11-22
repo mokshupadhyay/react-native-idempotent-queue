@@ -108,6 +108,8 @@ describe('fetchSender', () => {
       send: fetchSender('u', undefined, { fetch }),
       now: () => now,
       random: () => 0,
+      // These timers ignore the delay, so an attempt timeout would fire at once.
+      attemptTimeoutMs: Infinity,
       timers: { setTimeout: (callback) => Promise.resolve().then(callback), clearTimeout: () => undefined },
     });
     await queue.start();

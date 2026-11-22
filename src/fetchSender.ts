@@ -1,12 +1,43 @@
 import { HttpError } from './classify';
 import type { QueueItem, SendContext } from './types';
 
+/**
+ * Headers in any form `fetch` accepts: a plain object, an array of
+ * `[name, value]` pairs, or a `Headers` instance (anything with `forEach`).
+ */
+export type HeadersLike =
+  | Record<string, string>
+  | ReadonlyArray<readonly [string, string]>
+  | ReadonlyArray<readonly string[]>
+  | { forEach(callback: (value: string, name: string) => void): void };
+
 /** The subset of `fetch`'s `RequestInit` the sender sets or passes through. */
 export interface FetchInit {
   method?: string;
-  headers?: Record<string, string>;
+  headers?: HeadersLike;
   body?: unknown;
+  /** Used instead of the attempt's own signal when given. */
+  signal?: unknown;
   [option: string]: unknown;
+}
+
+/** The headers as `[name, value]` pairs, in their order. */
+function headerPairs(headers: HeadersLike | undefined): Array<[string, string]> {
+  const pairs: Array<[string, string]> = [];
+  if (!headers) return pairs;
+  if (Array.isArray(headers)) {
+    for (const pair of headers as ReadonlyArray<readonly string[]>) {
+      if (pair && pair.length >= 2) pairs.push([String(pair[0]), String(pair[1])]);
+    }
+  } else if (typeof (headers as { forEach?: unknown }).forEach === 'function') {
+    (headers as { forEach(callback: (value: string, name: string) => void): void }).forEach((value, name) => {
+      pairs.push([String(name), String(value)]);
+    });
+  } else {
+    const record = headers as Record<string, string>;
+    for (const name of Object.keys(record)) pairs.push([name, String(record[name])]);
+  }
+  return pairs;
 }
 
 export interface FetchResponseLike {
@@ -43,6 +74,8 @@ function parseBody(text: string, contentType: string | null): unknown {
  *
  * - uses `init.method`, or `POST`;
  * - sets the `Idempotency-Key` header (or `headerName`) to the item's key;
+ *   `init.headers` may be an object, an array of pairs or a `Headers` instance;
+ * - passes the attempt's `signal`, so an attempt that times out is aborted;
  * - sends `item.payload` as the body: strings as they are, anything else as
  *   JSON with `Content-Type: application/json` unless you set one;
  * - resolves with the response body (parsed when it is JSON) for 2xx, and
@@ -68,12 +101,11 @@ export function fetchSender<TPayload = unknown, TResult = unknown>(
     const base = (typeof init === 'function' ? init(item) : init) || {};
     const headers: Record<string, string> = {};
     let hasContentType = false;
-    const given = base.headers || {};
-    for (const name of Object.keys(given)) {
+    for (const [name, value] of headerPairs(base.headers)) {
       // Never let a caller's header override the item's key.
       if (name.toLowerCase() === headerName.toLowerCase()) continue;
       if (name.toLowerCase() === 'content-type') hasContentType = true;
-      headers[name] = given[name];
+      headers[name] = value;
     }
     headers[headerName] = context.key;
     let body: unknown = base.body;
@@ -85,12 +117,9 @@ export function fetchSender<TPayload = unknown, TResult = unknown>(
         if (!hasContentType) headers['Content-Type'] = 'application/json';
       }
     }
-    const response = await doFetch(typeof url === 'function' ? url(item) : url, {
-      ...base,
-      method: base.method || 'POST',
-      headers,
-      body,
-    });
+    const request: Record<string, unknown> = { ...base, method: base.method || 'POST', headers, body };
+    if (base.signal === undefined && context.signal !== undefined) request.signal = context.signal;
+    const response = await doFetch(typeof url === 'function' ? url(item) : url, request);
     let text = '';
     try {
       text = await response.text();

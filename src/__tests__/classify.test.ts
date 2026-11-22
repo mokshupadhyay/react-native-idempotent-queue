@@ -20,7 +20,7 @@ describe('defaultClassifyError', () => {
     ['401', new HttpError(401), { type: 'permanent' }],
     ['403', new HttpError(403), { type: 'permanent' }],
     ['404', new HttpError(404), { type: 'permanent' }],
-    ['409', new HttpError(409), { type: 'permanent' }],
+    ['409 (same key still processing)', new HttpError(409), { type: 'retryable' }],
     ['422', new HttpError(422), { type: 'permanent' }],
     ['304 thrown as an error', new HttpError(304), { type: 'permanent' }],
     ['600', new HttpError(600), { type: 'permanent' }],

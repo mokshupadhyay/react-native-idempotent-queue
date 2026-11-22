@@ -10,6 +10,9 @@ export type JsonObject = { [key: string]: JsonValue };
  * - `succeeded`: `send` resolved. Kept for `keepSucceededMs`, then pruned.
  * - `failed`: every allowed attempt failed with a retryable error. Call `retry(id)` to try again.
  * - `dead`: the classifier called the last error permanent. Call `retry(id)` to try again anyway.
+ *
+ * A `failed` or `dead` item holds back the later items of its group until it
+ * is retried to success or discarded.
  */
 export type QueueItemStatus = 'pending' | 'inflight' | 'succeeded' | 'failed' | 'dead';
 
@@ -35,7 +38,10 @@ export interface QueueItem<TPayload = unknown> {
   readonly id: string;
   /** Idempotency key sent with every attempt of this item. Never changes. */
   readonly key: string;
-  /** Items with the same group are sent one at a time, in enqueue order. */
+  /**
+   * Items with the same group are sent one at a time, in enqueue order. A
+   * `failed` or `dead` item holds back the later items of its group.
+   */
   readonly group?: string;
   readonly payload: TPayload;
   readonly metadata?: JsonObject;
@@ -63,12 +69,25 @@ export interface QueueStorage {
   removeItem(key: string): Promise<void>;
 }
 
+/** The parts of an `AbortSignal` the queue uses. A real `AbortSignal` matches. */
+export interface AbortSignalLike {
+  readonly aborted: boolean;
+  addEventListener(type: 'abort', listener: () => void): void;
+  removeEventListener(type: 'abort', listener: () => void): void;
+}
+
 /** What `send` receives besides the item. */
 export interface SendContext {
   /** The item's idempotency key. Send it to the server with every attempt. */
   key: string;
   /** 1 for the first attempt, 2 for the first retry, and so on. */
   attempt: number;
+  /**
+   * Aborted when the attempt times out (`attemptTimeoutMs`). Pass it to
+   * `fetch` (`fetchSender` does) so a hung request is cancelled. Undefined
+   * when the runtime has no `AbortController`.
+   */
+  signal?: AbortSignalLike;
 }
 
 /** The classifier's decision about an error thrown by `send`. */
@@ -133,6 +152,20 @@ export interface QueueOptions<TPayload = unknown, TResult = unknown> {
   /** Items sent at the same time. Items with the same `group` are always sequential. Default 1. */
   concurrency?: number;
   /**
+   * How long one attempt may run. Then `context.signal` is aborted and the
+   * attempt counts as a retryable failure. The item's key stays blocked until
+   * that `send` settles, so the same key is never in flight twice.
+   * `Infinity` turns the timeout off. Default 30000.
+   */
+  attemptTimeoutMs?: number;
+  /**
+   * Largest stored state, in UTF-8 bytes of the stored value. `enqueue`
+   * rejects with `QueueFullError` past it, and the quarantine is cut to it.
+   * Default 1000000 (1 MB), below Android AsyncStorage's limit of about 2 MB
+   * per value.
+   */
+  maxStorageBytes?: number;
+  /**
    * How long succeeded items stay, to deduplicate repeated enqueues of a key.
    * They are removed at the next queue activity after this time. Default 24 hours.
    */
@@ -182,7 +215,10 @@ export interface IdempotentQueue<TPayload = unknown, TResult = unknown> {
   load(): Promise<void>;
   /** Loads, returns interrupted items to `pending` and starts sending. */
   start(): Promise<void>;
-  /** Stops starting new attempts. Resolves when the attempts in flight have settled. */
+  /**
+   * Stops starting new attempts. Resolves when the attempts in flight have
+   * settled (or timed out) and every storage write requested so far has finished.
+   */
   stop(): Promise<void>;
   /**
    * Makes waiting items due now (except items waiting for a server's
@@ -195,12 +231,23 @@ export interface IdempotentQueue<TPayload = unknown, TResult = unknown> {
   /** Returns a `failed`, `dead` or `pending` item to `pending` with zero attempts, due now, same key. */
   retry(id: string): Promise<QueueItem<TPayload>>;
   /**
+   * Removes `failed` and `dead` items last updated at least `olderThanMs` ago
+   * (default 0: all of them) and resolves with how many were removed.
+   */
+  pruneFailed(options?: { olderThanMs?: number }): Promise<number>;
+  /**
    * Removes an item. An item in flight is removed now; its result is ignored and
    * its key stays blocked until the request settles.
    */
   discard(id: string): Promise<boolean>;
   subscribe(listener: QueueListener<TPayload, TResult>): () => void;
-  /** Waits for attempts in flight, then deletes every item and the stored data, including quarantined copies. */
+  /**
+   * Waits for attempts in flight, then deletes every item and the stored data,
+   * including quarantined copies. Calls to `enqueue`, `retry`, `discard`,
+   * `pruneFailed`, `flush` and `start` made while it runs wait for it, so an
+   * item enqueued during `clear()` is kept. A queue that was running, and was
+   * not stopped meanwhile, runs again afterwards, also when `clear()` rejects.
+   */
   clear(): Promise<void>;
   /** Whether `start` was called without a later `stop`. */
   isRunning(): boolean;
