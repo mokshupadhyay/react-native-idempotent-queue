@@ -303,6 +303,10 @@ Everything runs on a fake clock, so no test waits on real time. `NUM_RUNS=2000 n
 - `src/backoff.ts` and `src/classify.ts` decide when to try again. `src/errors.ts` holds `AttemptTimeoutError` and `QueueFullError`.
 - `src/keys.ts` generates keys. `src/storage.ts` and `src/connectivity.ts` are the optional adapters. `src/fetchSender.ts` and `src/hook.ts` are the `fetch` helper and the React hook.
 
+## Author
+
+Built and maintained by [Moksh Upadhyay](https://mokshupadhyay.com).
+
 ## License
 
 MIT
