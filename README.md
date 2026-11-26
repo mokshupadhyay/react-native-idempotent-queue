@@ -6,6 +6,8 @@
 
 A queue for requests that change state on a server, such as a payment, a transfer or an order, so they survive a flaky mobile network and an app that gets killed.
 
+Read why it works this way: [Safe to retry](https://mokshupadhyay.com/writing/safe-to-retry), with a retry simulator you can try in the browser.
+
 - **Saved before it is sent.** `enqueue` resolves only after the request is written to storage. Each attempt is recorded on disk before the request leaves.
 - **One idempotency key per request.** The key is created once and sent with every attempt: after a timeout, a 5xx, a lost response, or an app restart in the middle of a request.
 - **Never sent in parallel with itself.** A key is never in flight twice, even after an attempt times out. Items in the same `group` go one at a time, in order, and a failed item holds back the rest of its group.
